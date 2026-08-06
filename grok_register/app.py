@@ -22,6 +22,7 @@ import string
 import json
 from pathlib import Path
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -123,6 +124,8 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     # v3 only: upload CPA OAuth (Grok Build) after mint. Default off.
     "grok2api_auto_add_build": False,
+    # When true, Free Build chat probe must pass before v3 Build import.
+    "grok2api_build_require_chat": True,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
     # legacy | v3 | auto  (auto: prefer chenyme v3 admin API, fall back to legacy /tokens)
@@ -178,8 +181,11 @@ DEFAULT_CONFIG = {
     "cpa_cloud_upload_require_chat": True,
     "cpa_cloud_upload_chat_timeout": 45,
     "cpa_cloud_upload_chat_rounds": 3,
-    "cpa_cloud_upload_chat_interval": 0.2,
+    "cpa_cloud_upload_chat_interval": 1.5,
+    "cpa_cloud_upload_chat_concurrency": 1,
+    "cpa_cloud_upload_chat_round_pause": 3,
     "cpa_cloud_upload_batch_every": 10,
+    "cpa_cloud_upload_batch_pause": 20,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -889,21 +895,46 @@ def load_cpa_xai_auth_file(path: str) -> dict:
     return data
 
 
-def add_cpa_auth_to_grok2api_v3_build(auth_or_path, log_callback=None):
+def add_cpa_auth_to_grok2api_v3_build(auth_or_path, log_callback=None, skip_chat_gate=False):
     """Upload one CPA OAuth auth (Grok Build) to chenyme grok2api v3.
 
     API:
       POST {root}/api/admin/v1/accounts/import  (multipart OAuth JSON)
     Accepts a path to xai-*.json or an auth dict.
+
+    When `grok2api_build_require_chat` is true (default) and a local auth
+    file path is given, Free Build chat must pass before import. Use
+    `skip_chat_gate=True` for forced admin/manual pushes.
     """
+    path_hint = ""
+    path_for_probe = ""
     if isinstance(auth_or_path, (str, Path)):
-        auth = load_cpa_xai_auth_file(str(auth_or_path))
         path_hint = str(auth_or_path)
+        path_for_probe = os.path.abspath(os.path.expanduser(path_hint))
+        auth = load_cpa_xai_auth_file(path_hint)
     elif isinstance(auth_or_path, dict):
         auth = auth_or_path
         path_hint = str(auth.get("email") or "inline")
     else:
         raise ValueError("auth_or_path must be path or dict")
+
+    if (
+        (not skip_chat_gate)
+        and bool(config.get("grok2api_build_require_chat", True))
+        and path_for_probe
+        and os.path.isfile(path_for_probe)
+    ):
+        chat_gate = _probe_cpa_chat_for_upload(path_for_probe, config, log_callback)
+        if not chat_gate.get("ok"):
+            status = chat_gate.get("status")
+            reason = chat_gate.get("reason") or chat_gate.get("error") or "chat_probe_failed"
+            rounds = chat_gate.get("rounds") or config.get("cpa_cloud_upload_chat_rounds", 3)
+            if log_callback:
+                log_callback(
+                    f"[g2api-build] skip upload (chat gate failed after {rounds} rounds, "
+                    f"status={status} reason={reason}): {os.path.basename(path_for_probe)}"
+                )
+            return False
 
     mode = _grok2api_remote_mode()
     if mode == "legacy":
@@ -2339,6 +2370,10 @@ def prepare_browser_for_next_account(log_callback=None):
 
     When proxy pool rotates each account, restart browser so the new proxy
     (and auth extension) takes effect.
+
+    Callers that enqueue mint for the *current* account must capture
+    get_runtime_proxy() into the mint job *before* calling this, otherwise
+    mint would inherit the next account's rotated proxy.
     """
     global browser, page
     _bind_thread_browser_globals()
@@ -3876,8 +3911,21 @@ class GrokRegisterGUI:
         add_field(self.grok2api_remote_auto_check, 7, 1, sticky=tk.W)
         add_label(7, 2, "远端Build:")
         self.grok2api_build_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_build", False)))
-        self.grok2api_build_auto_check = tk_checkbutton(config_frame, variable=self.grok2api_build_auto_var)
-        add_field(self.grok2api_build_auto_check, 7, 3, sticky=tk.W)
+        self.grok2api_build_auto_check = tk_checkbutton(
+            config_frame, text="启用", variable=self.grok2api_build_auto_var
+        )
+        self.grok2api_build_chat_gate_var = tk.BooleanVar(
+            value=bool(config.get("grok2api_build_require_chat", True))
+        )
+        self.grok2api_build_chat_gate_check = tk_checkbutton(
+            config_frame, text="chat门禁", variable=self.grok2api_build_chat_gate_var
+        )
+        build_opts = tk.Frame(config_frame, bg=UI_PANEL_BG)
+        self.grok2api_build_auto_check.configure(bg=UI_PANEL_BG)
+        self.grok2api_build_chat_gate_check.configure(bg=UI_PANEL_BG)
+        self.grok2api_build_auto_check.pack(in_=build_opts, side=tk.LEFT)
+        self.grok2api_build_chat_gate_check.pack(in_=build_opts, side=tk.LEFT, padx=(8, 0))
+        add_field(build_opts, 7, 3, sticky=tk.W)
 
         add_label(8, 0, "grok2api 远端 Base:")
         self.grok2api_remote_base_var = tk.StringVar(value=str(config.get("grok2api_remote_base", "")))
@@ -3990,7 +4038,7 @@ class GrokRegisterGUI:
             value=bool(config.get("cpa_cloud_upload_require_chat", True))
         )
         self.cpa_chat_gate_check = tk_checkbutton(
-            cpa_frame, text="上传前探测", variable=self.cpa_chat_gate_var
+            cpa_frame, text="CPA云探测", variable=self.cpa_chat_gate_var
         )
         cpa_field(self.cpa_chat_gate_check, 2, 3, sticky=tk.W)
 
@@ -4012,76 +4060,94 @@ class GrokRegisterGUI:
         )
         cpa_field(self.cpa_chat_rounds_spin, 3, 1, sticky=tk.W)
 
-        cpa_label(3, 2, "CPA auth 目录:")
+        cpa_label(3, 2, "门禁间隔(s):")
+        self.cpa_chat_interval_var = tk.StringVar(
+            value=str(config.get("cpa_cloud_upload_chat_interval", 1.5))
+        )
+        self.cpa_chat_interval_entry = tk_entry(
+            cpa_frame, textvariable=self.cpa_chat_interval_var, width=8
+        )
+        cpa_field(self.cpa_chat_interval_entry, 3, 3, sticky=tk.W)
+
+        cpa_label(4, 0, "批间停顿(s):")
+        self.cpa_batch_pause_var = tk.StringVar(
+            value=str(config.get("cpa_cloud_upload_batch_pause", 20))
+        )
+        self.cpa_batch_pause_entry = tk_entry(
+            cpa_frame, textvariable=self.cpa_batch_pause_var, width=8
+        )
+        cpa_field(self.cpa_batch_pause_entry, 4, 1, sticky=tk.W)
+
+        cpa_label(4, 2, "CPA auth 目录:")
         self.cpa_auth_dir_var = tk.StringVar(value=str(config.get("cpa_auth_dir", "./output/cpa_auths")))
         self.cpa_auth_dir_entry = tk_entry(cpa_frame, textvariable=self.cpa_auth_dir_var, width=34)
-        cpa_field(self.cpa_auth_dir_entry, 3, 3)
+        cpa_field(self.cpa_auth_dir_entry, 4, 3)
 
-        cpa_label(4, 0, "CPAMP API Base:")
+        cpa_label(5, 0, "CPAMP API Base:")
         self.cpa_cloud_api_base_var = tk.StringVar(value=str(config.get("cpa_cloud_api_base", "")))
         self.cpa_cloud_api_base_entry = tk_entry(
             cpa_frame, textvariable=self.cpa_cloud_api_base_var, width=72
         )
-        cpa_field(self.cpa_cloud_api_base_entry, 4, 1, columnspan=3)
+        cpa_field(self.cpa_cloud_api_base_entry, 5, 1, columnspan=3)
 
-        cpa_label(5, 0, "CPAMP 管理密钥:")
+        cpa_label(6, 0, "CPAMP 管理密钥:")
         self.cpa_cloud_key_var = tk.StringVar(value=str(config.get("cpa_cloud_management_key", "")))
         self.cpa_cloud_key_entry = tk_entry(
             cpa_frame, textvariable=self.cpa_cloud_key_var, width=72, show="*"
         )
-        cpa_field(self.cpa_cloud_key_entry, 5, 1, columnspan=3)
+        cpa_field(self.cpa_cloud_key_entry, 6, 1, columnspan=3)
 
-        cpa_label(6, 0, "YesCaptcha Key:")
+        cpa_label(7, 0, "YesCaptcha Key:")
         self.yescaptcha_key_var = tk.StringVar(value=str(config.get("yescaptcha_api_key", "")))
         self.yescaptcha_key_entry = tk_entry(
             cpa_frame, textvariable=self.yescaptcha_key_var, width=34, show="*"
         )
-        cpa_field(self.yescaptcha_key_entry, 6, 1)
+        cpa_field(self.yescaptcha_key_entry, 7, 1)
 
-        cpa_label(6, 2, "protocol 调试:")
+        cpa_label(7, 2, "protocol 调试:")
         self.cpa_protocol_debug_var = tk.BooleanVar(
             value=bool(config.get("cpa_protocol_debug", False))
         )
         self.cpa_protocol_debug_check = tk_checkbutton(
             cpa_frame, text="详细日志", variable=self.cpa_protocol_debug_var
         )
-        cpa_field(self.cpa_protocol_debug_check, 6, 3, sticky=tk.W)
+        cpa_field(self.cpa_protocol_debug_check, 7, 3, sticky=tk.W)
 
-        cpa_label(7, 0, "代理池:")
+        cpa_label(8, 0, "代理池:")
         self.proxy_pool_enabled_var = tk.BooleanVar(
             value=bool(config.get("proxy_pool_enabled", False))
         )
         self.proxy_pool_enabled_check = tk_checkbutton(
             cpa_frame, text="启用 all_proxies", variable=self.proxy_pool_enabled_var
         )
-        cpa_field(self.proxy_pool_enabled_check, 7, 1, sticky=tk.W)
+        cpa_field(self.proxy_pool_enabled_check, 8, 1, sticky=tk.W)
 
-        cpa_label(7, 2, "每号换代理:")
+        cpa_label(8, 2, "每号换代理:")
         self.proxy_pool_rotate_var = tk.BooleanVar(
             value=bool(config.get("proxy_pool_rotate_each_account", True))
         )
         self.proxy_pool_rotate_check = tk_checkbutton(
             cpa_frame, text="rotate each account", variable=self.proxy_pool_rotate_var
         )
-        cpa_field(self.proxy_pool_rotate_check, 7, 3, sticky=tk.W)
+        cpa_field(self.proxy_pool_rotate_check, 8, 3, sticky=tk.W)
 
-        cpa_label(8, 0, "代理池文件:")
+        cpa_label(9, 0, "代理池文件:")
         self.proxy_pool_file_var = tk.StringVar(
             value=str(config.get("proxy_pool_file", "all_proxies.txt"))
         )
         self.proxy_pool_file_entry = tk_entry(
             cpa_frame, textvariable=self.proxy_pool_file_var, width=34
         )
-        cpa_field(self.proxy_pool_file_entry, 8, 1)
+        cpa_field(self.proxy_pool_file_entry, 9, 1)
 
-        cpa_label(8, 2, "代理池模式:")
+        cpa_label(9, 2, "代理池模式:")
         self.proxy_pool_mode_var = tk.StringVar(
             value=str(config.get("proxy_pool_mode", "random") or "random")
         )
         self.proxy_pool_mode_combo = tk_option_menu(
             cpa_frame, self.proxy_pool_mode_var, ["random", "round_robin"], width=12
         )
-        cpa_field(self.proxy_pool_mode_combo, 8, 3, sticky=tk.W)
+        cpa_field(self.proxy_pool_mode_combo, 9, 3, sticky=tk.W)
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=2, column=0, sticky=tk.EW, pady=(0, 6))
@@ -4133,6 +4199,7 @@ class GrokRegisterGUI:
             f"[*] 当前邮箱服务商: {self.email_provider_var.get()} | 注册数量: {self.count_var.get()} | "
             f"mint={self.cpa_mint_backend_var.get()} | 后台浏览器={bool(self.register_browser_bg_var.get())} | "
             f"云上传={bool(self.cpa_cloud_upload_var.get())} | chat门禁轮数={self.cpa_chat_rounds_var.get()} | "
+            f"门禁间隔={self.cpa_chat_interval_var.get()}s | 批间停顿={self.cpa_batch_pause_var.get()}s | "
             f"代理池={bool(self.proxy_pool_enabled_var.get())}"
         )
 
@@ -4176,6 +4243,7 @@ class GrokRegisterGUI:
         config["grok2api_pool_name"] = self.grok2api_pool_name_var.get().strip() or "ssoBasic"
         config["grok2api_auto_add_remote"] = bool(self.grok2api_remote_auto_var.get())
         config["grok2api_auto_add_build"] = bool(self.grok2api_build_auto_var.get())
+        config["grok2api_build_require_chat"] = bool(self.grok2api_build_chat_gate_var.get())
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
         config["grok2api_remote_mode"] = (self.grok2api_remote_mode_var.get() or "auto").strip() or "auto"
         config["grok2api_remote_username"] = (self.grok2api_remote_user_var.get() or "admin").strip() or "admin"
@@ -4207,6 +4275,20 @@ class GrokRegisterGUI:
         except Exception:
             config["cpa_cloud_upload_chat_rounds"] = 3
             self.cpa_chat_rounds_var.set("3")
+        try:
+            config["cpa_cloud_upload_chat_interval"] = max(
+                0.0, min(60.0, float(self.cpa_chat_interval_var.get() or 1.5))
+            )
+        except Exception:
+            config["cpa_cloud_upload_chat_interval"] = 1.5
+            self.cpa_chat_interval_var.set("1.5")
+        try:
+            config["cpa_cloud_upload_batch_pause"] = max(
+                0.0, min(600.0, float(self.cpa_batch_pause_var.get() or 20))
+            )
+        except Exception:
+            config["cpa_cloud_upload_batch_pause"] = 20.0
+            self.cpa_batch_pause_var.set("20")
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip() or "./output/cpa_auths"
         config["cpa_cloud_api_base"] = self.cpa_cloud_api_base_var.get().strip()
         config["cpa_cloud_management_key"] = self.cpa_cloud_key_var.get().strip()
@@ -4243,7 +4325,12 @@ class GrokRegisterGUI:
         self.log(
             f"[*] CPA: export={config.get('cpa_export_enabled')} mint={config.get('cpa_mint_backend')} "
             f"cloud={config.get('cpa_cloud_upload_enabled')} chat_gate={config.get('cpa_cloud_upload_require_chat')} "
-            f"rounds={config.get('cpa_cloud_upload_chat_rounds')} bg_browser={config.get('register_browser_background')}"
+            f"rounds={config.get('cpa_cloud_upload_chat_rounds')} "
+            f"interval={config.get('cpa_cloud_upload_chat_interval')}s "
+            f"batch_pause={config.get('cpa_cloud_upload_batch_pause')}s "
+            f"g2a_web={config.get('grok2api_auto_add_remote')} g2a_build={config.get('grok2api_auto_add_build')} "
+            f"build_gate={config.get('grok2api_build_require_chat')} "
+            f"bg_browser={config.get('register_browser_background')}"
         )
         if int(config.get("register_threads") or 1) > 1:
             self.log(
@@ -4492,6 +4579,7 @@ def flush_queued_cpa_cloud_uploads(cfg=None, log_callback=None, paths=None) -> d
     """
     cfg = cfg or config
     log = log_callback or (lambda m: None)
+    mid_batch = paths is not None
     if not cfg.get("cpa_cloud_upload_enabled", False):
         if paths is None:
             with _gui_pending_cloud_lock:
@@ -4545,7 +4633,17 @@ def flush_queued_cpa_cloud_uploads(cfg=None, log_callback=None, paths=None) -> d
             fail += 1
             log(f"[cloud-cpa] upload exception {os.path.basename(path)}: {exc}")
     log(f"[cloud-cpa] batch upload done: ok={ok} skip={skip} fail={fail} total={len(paths)}")
-    return {"ok": fail == 0, "count": len(paths), "success": ok, "skip": skip, "fail": fail}
+    result = {"ok": fail == 0, "count": len(paths), "success": ok, "skip": skip, "fail": fail}
+    if mid_batch:
+        try:
+            pause = float(cfg.get("cpa_cloud_upload_batch_pause", 20) or 0)
+        except Exception:
+            pause = 20.0
+        pause = max(0.0, min(pause, 600.0))
+        if pause > 0:
+            log(f"[cloud-cpa] mid-batch pause {pause}s (gate cool-down before next batch)")
+            time.sleep(pause)
+    return result
 
 
 def _probe_cpa_chat_once(cpa_path, cfg=None):
@@ -4638,10 +4736,20 @@ def probe_cpa_auth_paths_round_robin(paths, cfg=None, log_callback=None):
         rounds = 3
     rounds = max(1, min(rounds, 10))
     try:
-        interval = float(cfg.get("cpa_cloud_upload_chat_interval", 0.2) or 0)
+        interval = float(cfg.get("cpa_cloud_upload_chat_interval", 1.5) or 0)
     except Exception:
-        interval = 0.2
-    interval = max(0.0, min(interval, 5.0))
+        interval = 1.5
+    interval = max(0.0, min(interval, 60.0))
+    try:
+        concurrency = int(cfg.get("cpa_cloud_upload_chat_concurrency", 1) or 1)
+    except Exception:
+        concurrency = 1
+    concurrency = max(1, min(concurrency, 4))
+    try:
+        round_pause = float(cfg.get("cpa_cloud_upload_chat_round_pause", 3) or 0)
+    except Exception:
+        round_pause = 3.0
+    round_pause = max(0.0, min(round_pause, 120.0))
 
     pending = []
     seen = set()
@@ -4662,31 +4770,79 @@ def probe_cpa_auth_paths_round_robin(paths, cfg=None, log_callback=None):
 
     log(
         f"[cloud-cpa] chat gate (account-round-robin): {len(pending)} account(s), "
-        f"rounds={rounds}, interval={interval}s"
+        f"rounds={rounds}, interval={interval}s, concurrency={concurrency}, "
+        f"round_pause={round_pause}s"
     )
     for r in range(1, rounds + 1):
         if not pending:
             break
+        if r > 1 and round_pause > 0:
+            log(f"[cloud-cpa] chat gate round pause {round_pause}s before round {r}/{rounds}")
+            time.sleep(round_pause)
         log(f"[cloud-cpa] chat gate round {r}/{rounds}: probing {len(pending)} pending account(s)")
         still = []
-        for path in pending:
-            res = _probe_cpa_chat_once(path, cfg)
-            name = res.get("name") or os.path.basename(path)
-            if res.get("ok"):
-                log(
-                    f"[cloud-cpa] chat gate round {r}/{rounds}: PASS {name} "
-                    f"status={res.get('status')}"
-                )
-                passed.append(path)
-            else:
-                log(
-                    f"[cloud-cpa] chat gate round {r}/{rounds}: fail {name} "
-                    f"status={res.get('status')} reason={res.get('reason')}"
-                )
-                failed[path] = res
-                still.append(path)
-            if interval > 0:
-                time.sleep(interval)
+        if concurrency <= 1:
+            for path in pending:
+                res = _probe_cpa_chat_once(path, cfg)
+                name = res.get("name") or os.path.basename(path)
+                if res.get("ok"):
+                    log(
+                        f"[cloud-cpa] chat gate round {r}/{rounds}: PASS {name} "
+                        f"status={res.get('status')}"
+                    )
+                    passed.append(path)
+                else:
+                    log(
+                        f"[cloud-cpa] chat gate round {r}/{rounds}: fail {name} "
+                        f"status={res.get('status')} reason={res.get('reason')}"
+                    )
+                    failed[path] = res
+                    still.append(path)
+                if interval > 0:
+                    time.sleep(interval)
+        else:
+            # Probe in chunks of size=concurrency; pause interval after each chunk.
+            for i in range(0, len(pending), concurrency):
+                chunk = pending[i : i + concurrency]
+                results = {}
+                with ThreadPoolExecutor(max_workers=len(chunk)) as ex:
+                    futs = {ex.submit(_probe_cpa_chat_once, path, cfg): path for path in chunk}
+                    for fut in as_completed(futs):
+                        path = futs[fut]
+                        try:
+                            results[path] = fut.result()
+                        except Exception as exc:
+                            results[path] = {
+                                "ok": False,
+                                "status": 0,
+                                "reason": f"probe_exception:{exc}",
+                                "path": path,
+                                "name": os.path.basename(path),
+                            }
+                for path in chunk:
+                    res = results.get(path) or {
+                        "ok": False,
+                        "status": 0,
+                        "reason": "chat_probe_failed",
+                        "path": path,
+                        "name": os.path.basename(path),
+                    }
+                    name = res.get("name") or os.path.basename(path)
+                    if res.get("ok"):
+                        log(
+                            f"[cloud-cpa] chat gate round {r}/{rounds}: PASS {name} "
+                            f"status={res.get('status')}"
+                        )
+                        passed.append(path)
+                    else:
+                        log(
+                            f"[cloud-cpa] chat gate round {r}/{rounds}: fail {name} "
+                            f"status={res.get('status')} reason={res.get('reason')}"
+                        )
+                        failed[path] = res
+                        still.append(path)
+                if interval > 0 and (i + concurrency) < len(pending):
+                    time.sleep(interval)
         pending = still
 
     for path in pending:
@@ -4869,6 +5025,15 @@ def run_cpa_and_sub2api_export(email, password, sso, log_callback=None):
                 result["cloud_cpa_upload"] = {"ok": True, "queued": True, "path": cloud_path}
             else:
                 result["cloud_cpa_upload"] = {"ok": False, "skipped": True, "reason": "disabled_or_no_path"}
+            if cloud_path and config.get("grok2api_auto_add_build", False):
+                try:
+                    build_ok = bool(
+                        add_cpa_auth_to_grok2api_v3_build(str(cloud_path), log_callback=log)
+                    )
+                    result["grok2api_build_upload"] = {"ok": build_ok, "path": cloud_path}
+                except Exception as g2a_exc:
+                    log(f"[Debug] grok2api Build 导入失败: {g2a_exc}")
+                    result["grok2api_build_upload"] = {"ok": False, "error": str(g2a_exc)}
             sub = result.get("sub2api") or {}
             if sub.get("ok"):
                 log(f"[sub2api] json -> {sub.get('combined_path') or sub.get('path')}")
@@ -5114,4 +5279,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -161,6 +161,7 @@ def _flush_cloud_uploads(config: dict, paths: list[str] | None = None) -> dict:
     - paths=None: drain all pending (final flush)
     - paths=[...]: flush a pre-taken chunk (mid-batch every N)
     """
+    mid_batch = paths is not None
     if not config.get("cpa_cloud_upload_enabled", False):
         if paths is None:
             with _pending_cloud_lock:
@@ -177,7 +178,21 @@ def _flush_cloud_uploads(config: dict, paths: list[str] | None = None) -> dict:
 
     # Serialize mid-batch + final flushes so stats/logs stay coherent.
     with _cloud_flush_lock:
-        return _flush_cloud_uploads_locked(config, paths)
+        result = _flush_cloud_uploads_locked(config, paths)
+        if mid_batch:
+            try:
+                pause = float(config.get("cpa_cloud_upload_batch_pause", 20) or 0)
+            except Exception:
+                pause = 20.0
+            pause = max(0.0, min(pause, 600.0))
+            if pause > 0:
+                log(
+                    0,
+                    f"[cloud-cpa] mid-batch pause {pause}s "
+                    f"(gate cool-down before next batch)",
+                )
+                time.sleep(pause)
+        return result
 
 
 def _flush_cloud_uploads_locked(config: dict, paths: list[str]) -> dict:
@@ -356,12 +371,16 @@ def register_one(
 
     # Pin a proxy for this account/thread before browser start.
     try:
-        reg.assign_thread_proxy(lambda m: log(worker_id, m), force_new=True)
-    except Exception as exc:
-        log(worker_id, f"[proxy] assign failed: {exc}")
-
-    try:
-        _ensure_browser(worker_id, force_recycle=False)
+        pool_on = bool(getattr(reg, "config", {}).get("proxy_pool_enabled", False))
+        if pool_on:
+            # Recycle browser so Chromium proxy/auth-extension matches the pin
+            # assigned inside start_browser (prepare may have left another proxy).
+            # start_browser → assign_thread_proxy(force_new=False) still rotates
+            # when proxy_pool_rotate_each_account=true.
+            _ensure_browser(worker_id, force_recycle=True)
+        else:
+            reg.assign_thread_proxy(lambda m: log(worker_id, m), force_new=False)
+            _ensure_browser(worker_id, force_recycle=False)
     except Exception as exc:
         log(worker_id, f"! 浏览器启动失败: {exc}")
         return None
@@ -438,6 +457,18 @@ def register_one(
         sso = reg.wait_for_sso_cookie(
             log_callback=lambda m: log(worker_id, m), cancel_callback=cancel
         )
+        if bool(getattr(reg, "config", {}).get("enable_nsfw", True)):
+            log(worker_id, "6. 开启 NSFW")
+            try:
+                nsfw_ok, nsfw_msg = reg.enable_nsfw_for_token(
+                    sso, log_callback=lambda m: log(worker_id, m)
+                )
+                if nsfw_ok:
+                    log(worker_id, f"+ NSFW 开启成功: {nsfw_msg}")
+                else:
+                    log(worker_id, f"! NSFW 未开启，继续保存账号: {nsfw_msg}")
+            except Exception as nsfw_exc:
+                log(worker_id, f"! NSFW 异常，继续保存账号: {nsfw_exc}")
         password = profile.get("password", "") or ""
         line = f"{email}----{password}----{sso}\n"
         os.makedirs(os.path.dirname(os.path.abspath(accounts_file)) or ".", exist_ok=True)
@@ -470,6 +501,20 @@ def register_one(
         except Exception as exc:
             log(worker_id, f"[Debug] grok2api: {exc}")
 
+        # Bind mint to the *register* proxy BEFORE prepare_browser rotates the
+        # pool pin for the next account (was: capture after prepare → wrong proxy).
+        try:
+            from grok_register.cpa_xai.proxyutil import get_runtime_proxy, proxy_log_label
+
+            job_proxy = (get_runtime_proxy() or "").strip()
+            if job_proxy:
+                log(
+                    worker_id,
+                    f"[proxy] bind register→mint {proxy_log_label(job_proxy)}",
+                )
+        except Exception:
+            job_proxy = ""
+
         # Release / recycle register browser BEFORE mint so peak browsers ≈ R+M
         try:
             # Reuse register browser across accounts when enabled; otherwise quit.
@@ -488,12 +533,6 @@ def register_one(
             except Exception:
                 pass
 
-        try:
-            from grok_register.cpa_xai.proxyutil import get_runtime_proxy
-
-            job_proxy = get_runtime_proxy() or ""
-        except Exception:
-            job_proxy = ""
         job = {
             "email": email,
             "password": password,
@@ -594,7 +633,11 @@ def _run_mint_job(worker_id: int | str, job: dict[str, Any], config: dict) -> di
             if attempt == 1 and str(job.get("proxy") or "").strip():
                 jp = str(job.get("proxy") or "").strip()
                 set_runtime_proxy(jp)
-                log(worker_id, f"[proxy] mint pin {proxy_log_label(jp)} (try {attempt}/{max_tries})")
+                log(
+                    worker_id,
+                    f"[proxy] mint pin (same as register) {proxy_log_label(jp)} "
+                    f"(try {attempt}/{max_tries})",
+                )
             elif pool_on:
                 from grok_register.cpa_xai.proxyutil import (
                     is_pool_exhausted,

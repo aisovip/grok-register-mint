@@ -254,6 +254,7 @@ uv run python cf_mail_debug.py `
   "grok2api_pool_name": "ssoBasic",
   "grok2api_auto_add_remote": false,
   "grok2api_auto_add_build": false,
+  "grok2api_build_require_chat": true,
   "grok2api_remote_base": "http://你的服务器:5003",
   "grok2api_remote_mode": "auto",
   "grok2api_remote_username": "admin",
@@ -267,6 +268,7 @@ uv run python cf_mail_debug.py `
 
 - **v3 Web**：注册成功后的 SSO JWT 作为 Grok Web 账号导入（`grok2api_auto_add_remote`）。
 - **v3 Build**：CPA mint 后的 `output/cpa_auths/xai-*.json` 作为 Grok Build OAuth 导入（`grok2api_auto_add_build`，仅 v3/auto）。
+- **Build chat 门禁**：`grok2api_build_require_chat`（默认 `true`）上传 Build 前探测 Free Build chat；403/失败则**跳过 Build 导入**（Web SSO 不受影响）。轮数复用 `cpa_cloud_upload_chat_rounds`。
 - Web tier：`ssoBasic`→`basic`，`ssoSuper`→`super`，可用 `grok2api_v3_web_tier` 覆盖。
 - **legacy**：`grok2api_remote_base` 可填站点根或 `/admin/api`；优先 `/tokens/add`。
 - 打开远端：设 `grok2api_auto_add_remote: true`，并填 `remote_base` +（v3 密码 **或** legacy `app_key`）。
@@ -282,13 +284,25 @@ uv run python cf_mail_debug.py `
   "cpa_cloud_upload_retries": 3,
   "cpa_cloud_upload_require_chat": true,
   "cpa_cloud_upload_chat_timeout": 45,
-  "cpa_cloud_upload_chat_rounds": 3
+  "cpa_cloud_upload_chat_rounds": 3,
+  "cpa_cloud_upload_chat_interval": 1.5,
+  "cpa_cloud_upload_chat_concurrency": 1,
+  "cpa_cloud_upload_chat_round_pause": 3,
+  "cpa_cloud_upload_batch_every": 10,
+  "cpa_cloud_upload_batch_pause": 20
 }
 ```
 
 关闭时只会把认证文件写到本地 `output/cpa_auths/`。
 
-`cpa_cloud_upload_require_chat`（默认 `true`）：**整批 mint 结束后**再统一做 chat 门禁。按 **账号轮询**（第 1 轮对所有待测号各测 1 次，第 2 轮只测仍失败的号…），默认 `cpa_cloud_upload_chat_rounds=3`。**任一轮通过即可上传**；全部轮次都失败才跳过。不是「同一账号连测 N 次」。
+`cpa_cloud_upload_require_chat`（默认 `true`）：按 **账号轮询** 做 Free Build chat 门禁（第 1 轮对所有待测号各测 1 次，第 2 轮只测仍失败的号…），默认 `cpa_cloud_upload_chat_rounds=3`。**任一轮通过即可上传**；全部轮次都失败才跳过。不是「同一账号连测 N 次」。
+
+门禁节流（大批量易触发上游 403/限流时建议开启）：
+- `cpa_cloud_upload_chat_interval`（默认 `1.5` 秒）：相邻探测间隔；串行时为每个号之间的间隔
+- `cpa_cloud_upload_chat_concurrency`（默认 `1`）：门禁并发上限（1–4）；默认串行
+- `cpa_cloud_upload_chat_round_pause`（默认 `3` 秒）：轮次之间停顿
+- `cpa_cloud_upload_batch_every`（默认 `10`）：每 mint 满 N 个号就做一次 mid-batch 门禁+上传
+- `cpa_cloud_upload_batch_pause`（默认 `20` 秒）：**mid-batch 上传结束后**再停顿，再继续下一批（最终 drain 不停）
 
 ### 6. 代理（按网络情况）
 
@@ -323,7 +337,7 @@ uv run python cf_mail_debug.py `
 
 | 字段 | 默认建议 | 说明 |
 | --- | --- | --- |
-| `enable_nsfw` | `false` | 注册后尝试开 NSFW；常被 Cloudflare 403，不影响出号 |
+| `enable_nsfw` | `true` | 注册后尝试开 NSFW；常被 Cloudflare 403，不影响出号 |
 | `user_agent` | 保持示例 | 浏览器 UA |
 | `cpa_probe_after_write` | 按需 | mint 后探测模型；批量可关以加快速度 |
 | `cpa_probe_chat` | `false` | 额外聊天探测，更慢 |
@@ -407,7 +421,7 @@ uv run python -u register_cli.py --count 100 --threads 2 --fast
 ### 明确指定 mint 并发
 
 ```powershell
-uv run python -u register_cli.py --count 100 --threads 2 --mint-workers 2 --fast
+uv run python -u register_cli.py --count 100 --threads 1 --mint-workers 1 --fast
 ```
 
 ### 更高并发（机器和邮箱扛得住再上）

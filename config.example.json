@@ -8,7 +8,7 @@
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
     "proxy": "",
-    "enable_nsfw": false,
+    "enable_nsfw": true,
     "proxy_pool_enabled": false,
     "proxy_pool_file": "all_proxies.txt",
     "proxy_pool_mode": "random",
@@ -24,6 +24,7 @@
     "grok2api_pool_name": "ssoBasic",
     "grok2api_auto_add_remote": false,
     "grok2api_auto_add_build": false,
+    "grok2api_build_require_chat": true,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
     "grok2api_remote_mode": "auto",
@@ -72,6 +73,9 @@
     "cpa_cloud_upload_require_chat": true,
     "cpa_cloud_upload_chat_timeout": 45,
     "cpa_cloud_upload_chat_rounds": 3,
-    "cpa_cloud_upload_chat_interval": 0.2,
-    "cpa_cloud_upload_batch_every": 10
+    "cpa_cloud_upload_chat_interval": 1.5,
+    "cpa_cloud_upload_chat_concurrency": 1,
+    "cpa_cloud_upload_chat_round_pause": 3,
+    "cpa_cloud_upload_batch_every": 10,
+    "cpa_cloud_upload_batch_pause": 20
 }
